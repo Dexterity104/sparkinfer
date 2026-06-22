@@ -53,6 +53,7 @@
   .tcard p{font-size:13px;margin-top:8px}
   .tcard .spec{font-family:"Sora";font-size:11.5px;color:var(--muted);margin-top:10px}
   .tcard a{font-size:12.5px;font-weight:600;margin-top:10px;display:inline-block}
+  .arch{position:absolute;top:14px;right:14px;font-family:"Sora";font-size:10.5px;font-weight:700;color:var(--theme);background:rgba(123,93,255,.08);border:1px solid rgba(123,93,255,.25);border-radius:6px;padding:2px 7px;letter-spacing:.02em}
   @media(max-width:820px){.targets{grid-template-columns:1fr 1fr}}
 
   /* KPI cards pulled up over the hero */
@@ -130,28 +131,44 @@
   <div class="kpis" id="kpis"></div>
 
   <section>
-    <div class="sec-h"><h2>What we target</h2><span class="hint">every NVIDIA Blackwell on-device GPU — for agentic AI</span></div>
+    <div class="sec-h"><h2>Target GPUs</h2><span class="hint">NVIDIA Blackwell, on-device — consumer <code>sm_120</code> + edge <code>sm_121</code> (not datacenter sm_100)</span></div>
     <div class="targets">
-      <div class="tcard"><div class="ic">⚡</div><h4>RTX Spark <span style="font-weight:400;color:var(--muted);font-size:12px">GB10</span></h4>
-        <div class="role">Personal AI PC · flagship</div>
+      <div class="tcard"><span class="arch">sm_121</span><div class="ic">⚡</div><h4>RTX Spark <span style="font-weight:400;color:var(--muted);font-size:12px">GB10</span></h4>
+        <div class="role">Personal AI PC · flagship target</div>
         <p>"A new class of processor for the age of personal agents." Run agents locally and privately on a Windows PC.</p>
-        <div class="spec">128 GB unified · 1 PFLOP FP4 · 120B-param LLMs · sm_121</div>
+        <div class="spec">128 GB unified · 1 PFLOP FP4 · 120B-param LLMs</div>
         <a href="https://nvidianews.nvidia.com/news/nvidia-microsoft-windows-pcs-agents-rtx-spark" target="_blank" rel="noopener">NVIDIA × Microsoft ↗</a></div>
-      <div class="tcard"><div class="ic">🤖</div><h4>Jetson Thor</h4>
+      <div class="tcard"><span class="arch">sm_121</span><div class="ic">🤖</div><h4>Jetson Thor</h4>
         <div class="role">Physical AI &amp; robotics</div>
         <p>"The ultimate platform for physical AI and robotics" — agentic reasoning at the edge, in humanoid robots.</p>
-        <div class="spec">2,070 FP4 TFLOPS · 128 GB LPDDR5X · sm_121</div>
+        <div class="spec">2,070 FP4 TFLOPS · 128 GB LPDDR5X</div>
         <a href="https://www.nvidia.com/en-us/autonomous-machines/embedded-systems/jetson-thor/" target="_blank" rel="noopener">Jetson Thor ↗</a></div>
-      <div class="tcard"><div class="ic">🖥️</div><h4>RTX 5090</h4>
-        <div class="role">Consumer Blackwell</div>
-        <p>Desktop flagship — big-model local inference on a 32 GB card. Our current frontier GPU.</p>
-        <div class="spec">32 GB GDDR7 · ~1.79 TB/s · sm_120</div>
+      <div class="tcard"><span class="arch">sm_120</span><div class="ic">🖥️</div><h4>RTX 5090</h4>
+        <div class="role">Consumer Blackwell · current dev GPU</div>
+        <p>Desktop flagship — big-model local inference on a 32 GB card. Where the frontier is measured today.</p>
+        <div class="spec">32 GB GDDR7 · ~1.79 TB/s</div>
         <a href="https://www.nvidia.com/en-us/geforce/graphics-cards/50-series/rtx-5090/" target="_blank" rel="noopener">RTX 5090 ↗</a></div>
-      <div class="tcard"><div class="ic">🛠️</div><h4>RTX PRO 6000</h4>
+      <div class="tcard"><span class="arch">sm_120</span><div class="ic">🛠️</div><h4>RTX PRO 6000</h4>
         <div class="role">Workstation flagship</div>
         <p>96 GB Blackwell — a full MoE plus all experts and a large KV cache stay resident, no paging.</p>
-        <div class="spec">96 GB GDDR7 · ~1.79 TB/s · sm_120</div>
+        <div class="spec">96 GB GDDR7 · ~1.79 TB/s</div>
         <a href="https://www.nvidia.com/en-us/products/workstations/" target="_blank" rel="noopener">RTX PRO ↗</a></div>
+    </div>
+  </section>
+
+  <section>
+    <div class="sec-h"><h2>Target models</h2><span class="hint">two architecturally distinct MoEs — a win must hold on <b>both</b>, or it's overfitting</span></div>
+    <div class="grid2">
+      <div class="tcard"><span class="arch" style="color:var(--ok);background:rgba(14,138,22,.08);border-color:rgba(14,138,22,.28)">proven</span>
+        <div class="ic">🟣</div><h4>Qwen3-MoE</h4>
+        <div class="role">model #1 · today's frontier</div>
+        <p>Qwen3-30B-A3B / 35B-A3B — 128–256 experts, top-8, GQA head_dim 128, uniform full attention. Runs end-to-end at the current frontier with <b>100% token-match</b> vs llama.cpp.</p>
+        <div class="spec">Q4_K_M · experts kept quantized · verified on RTX 5090 + PRO 6000</div></div>
+      <div class="tcard"><span class="arch" style="color:var(--warn);background:rgba(184,134,11,.08);border-color:rgba(184,134,11,.3)">wiring</span>
+        <div class="ic">🔷</div><h4>Gemma 4</h4>
+        <div class="role">model #2 · the generality test</div>
+        <p>Gemma 4 26B-A4B — 128 experts top-8 + shared, interleaved local-SWA / global attention, <b>head_dim 512</b>, dual RoPE. Deliberately unlike Qwen, so an optimization can't overfit one architecture.</p>
+        <div class="spec">distinct attention + routing → the anti-overfit guard for the basket</div></div>
     </div>
   </section>
 
