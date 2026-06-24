@@ -18,6 +18,13 @@ import argparse, datetime, json, os, re, subprocess, sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 
+# vast_eval.py self-heals dead boxes (recreates them) and writes the working instance id here;
+# prefer it over --instance so we reuse the recreated box instead of retrying the dead one.
+INSTANCE_FILE = os.path.expanduser(os.environ.get("VAST_INSTANCE_FILE", "~/.sparkinfer_vast_instance"))
+def current_instance(default):
+    try: return int(open(INSTANCE_FILE).read().strip())
+    except Exception: return default
+
 # Subsystem buckets for the deterministic area:<name> label (from a PR's top-level changed
 # dirs — no AI). Categorization/display only: SN74 scoring is speedup-only (the eval:* tier),
 # NOT a per-subsystem budget.
@@ -135,7 +142,7 @@ def main():
             print(f"PR #{num} @ {oid}: already evaluated — skip eval"); continue
         print(f"PR #{num} @ {oid}: evaluating '{branch}' ...")
         r = subprocess.run([sys.executable, os.path.join(HERE, "vast_eval.py"),
-                            "--reuse", str(args.instance), "--ref", branch,
+                            "--reuse", str(current_instance(args.instance)), "--ref", branch,
                             "--frontier", str(frontier), "--ceiling", str(args.ceiling)],
                            cwd=ROOT, capture_output=True, text=True, timeout=14400)
         line = next((l for l in r.stdout.splitlines() if l.startswith("RESULT_JSON")), None)

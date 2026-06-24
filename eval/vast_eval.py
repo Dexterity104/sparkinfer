@@ -13,7 +13,11 @@ bench/scripts/label.py (deterministic) — this script only orchestrates.
 By default the instance is STOPPED after every eval: compute billing pauses while the disk and
 cached weights (/workspace/models) persist for a fast next run. --keep leaves it running.
 
-Env: VAST_API_KEY, SSH_KEY (default ~/.ssh/id_ed25519), LLAMACPP_DIR, EVAL_IMAGE, EVAL_REPO.
+Self-healing: on --reuse, if the box won't become SSH-ready within --reuse-timeout (default 5 min),
+it is stopped and a fresh box is provisioned via the vast API automatically; the new id is saved to
+~/.sparkinfer_vast_instance (VAST_INSTANCE_FILE) so the next run reuses it. --no-recreate disables this.
+
+Env: VAST_API_KEY, SSH_KEY (default ~/.ssh/id_ed25519), LLAMACPP_DIR, EVAL_IMAGE, EVAL_REPO, VAST_INSTANCE_FILE.
 """
 import argparse, json, os, subprocess, sys, time
 from vastai import VastAI
@@ -22,6 +26,7 @@ REPO    = os.environ.get("EVAL_REPO",  "https://github.com/gittensor-ai-lab/spar
 IMAGE   = os.environ.get("EVAL_IMAGE", "nvidia/cuda:12.8.0-devel-ubuntu24.04")   # needs nvcc for sm_120
 SSH_KEY = os.path.expanduser(os.environ.get("SSH_KEY", "~/.ssh/id_ed25519"))
 LLAMACPP_DIR = os.environ.get("LLAMACPP_DIR", "/workspace/.llamacpp")            # persists across stop/start
+INSTANCE_FILE = os.path.expanduser(os.environ.get("VAST_INSTANCE_FILE", "~/.sparkinfer_vast_instance"))  # self-healed id
 
 def sh(host, port, cmd, timeout=3600):
     return subprocess.run(
@@ -48,6 +53,47 @@ def wait_ssh(host, port, tries=60):
         time.sleep(10)
     return False
 
+def save_instance(iid):
+    try:
+        with open(INSTANCE_FILE, "w") as f: f.write(str(iid))
+    except Exception: pass
+
+def bring_up(v, iid, deadline_s):
+    """Start the instance if needed and wait until SSH-reachable, within deadline_s.
+    Returns (host, port), or None if it never comes up (treat the box as dead/stuck)."""
+    info = info_of(v, iid)
+    if not info:
+        print(f">> instance {iid} not found"); return None
+    if info.get("actual_status") != "running":
+        print(f">> starting instance {iid} ...")
+        try: v.start_instance(id=iid)
+        except Exception as e: print("  start:", str(e)[:150])
+    deadline = time.time() + deadline_s
+    while time.time() < deadline:
+        info = info_of(v, iid)
+        st = (info or {}).get("actual_status")
+        if info and st == "running" and (info.get("public_ipaddr") or info.get("ssh_host")):
+            host, port = endpoint(info)
+            if wait_ssh(host, port, tries=4):     # box running; probe SSH (~40s), retry until deadline
+                print(f">> instance {iid}: ssh root@{host}:{port}")
+                return host, port
+        else:
+            print(f"  instance {iid}: status={st or '?'} — waiting ...")
+        time.sleep(15)
+    print(f">> instance {iid} did not become SSH-ready within {deadline_s}s")
+    return None
+
+def provision(v, args):
+    """Create a fresh instance via the vast API. Returns the new instance id, or None."""
+    offers = v.search_offers(query=f"gpu_name={args.gpu} num_gpus=1 cuda_vers>=12.8 inet_down>=100",
+                             order="dph_total", limit=10)
+    if not offers:
+        print(">> no matching offers"); return None
+    off = offers[0]
+    print(f">> creating instance on offer {off['id']} {off.get('gpu_name')} ${off.get('dph_total'):.3f}/hr")
+    inst = v.create_instance(id=off["id"], image=args.image, disk=120, ssh=True, direct=True)
+    return inst.get("new_contract") or inst.get("id")
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--ref", default="main")
@@ -58,31 +104,44 @@ def main():
     ap.add_argument("--destroy", action="store_true", help="destroy after eval instead of stopping (also frees the disk)")
     ap.add_argument("--gpu", default="RTX_5090")
     ap.add_argument("--image", default=IMAGE)
+    ap.add_argument("--reuse-timeout", type=int, default=300, help="seconds to wait for a reused box before recreating (default 300 = 5 min)")
+    ap.add_argument("--new-timeout", type=int, default=900, help="seconds to wait for a freshly created box")
+    ap.add_argument("--no-recreate", action="store_true", help="on reuse failure, error out instead of provisioning a new box")
     args = ap.parse_args()
 
     v = VastAI(); created = False; iid = args.reuse
-    if not iid:
-        offers = v.search_offers(query=f"gpu_name={args.gpu} num_gpus=1 cuda_vers>=12.8 inet_down>=100",
-                                 order="dph_total", limit=10)
-        if not offers: sys.exit("no matching offers")
-        off = offers[0]
-        print(f">> create on offer {off['id']} {off.get('gpu_name')} ${off.get('dph_total'):.3f}/hr")
-        inst = v.create_instance(id=off["id"], image=args.image, disk=120, ssh=True, direct=True)
-        iid = inst.get("new_contract") or inst.get("id"); created = True
+    host = port = None
 
-    info = info_of(v, iid)
-    if info and info.get("actual_status") != "running":
-        print(f">> starting instance {iid} ...")
-        try: v.start_instance(id=iid)
-        except Exception as e: print("start:", str(e)[:150])
-    for _ in range(60):
-        info = info_of(v, iid)
-        if info and info.get("actual_status") == "running" and (info.get("public_ipaddr") or info.get("ssh_host")): break
-        time.sleep(10)
-    if not info: sys.exit(f"instance {iid} not found")
-    host, port = endpoint(info)
-    print(f">> instance {iid}: ssh root@{host}:{port}")
-    if not wait_ssh(host, port): sys.exit("ssh never came up")
+    # 1) Try to bring up the reused box within a bounded window (default 5 min).
+    if iid:
+        ep = bring_up(v, iid, args.reuse_timeout)
+        if ep:
+            host, port = ep
+        elif args.no_recreate:
+            sys.exit(f"instance {iid} never came up (--no-recreate)")
+        else:
+            # Stop scheduling on the dead/stuck box, then fall through to provision a fresh one.
+            print(f">> reused instance {iid} is dead/stuck — stopping it and provisioning a new box")
+            try: v.stop_instance(id=iid)
+            except Exception as e: print("  stop:", str(e)[:150])
+            iid = 0
+
+    # 2) No working box yet → create one via the vast API and bring it up.
+    if not iid:
+        iid = provision(v, args)
+        if not iid: sys.exit("could not provision an instance")
+        created = True
+        ep = bring_up(v, iid, args.new_timeout)    # fresh box: longer (provision + boot + first apt)
+        if not ep:
+            try: v.destroy_instance(id=iid)         # clean up a born-dead box
+            except Exception: pass
+            sys.exit(f"new instance {iid} never came up")
+        host, port = ep
+
+    save_instance(iid)                              # persist the working id (the bot reuses it next run)
+    if args.reuse and iid != args.reuse:
+        print(f"NEW_INSTANCE_ID {iid}")             # machine-readable for the bot
+        print(f">> switched to fresh instance {iid} (old {args.reuse} stopped; destroy it if unneeded)")
 
     try:
         setup = ("export DEBIAN_FRONTEND=noninteractive; "
