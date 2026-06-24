@@ -28,6 +28,9 @@ TEMPLATE_HASH = os.environ.get("EVAL_TEMPLATE_HASH", "1ea6ef1d8cc4ad95e710c4c1da
 SSH_KEY = os.path.expanduser(os.environ.get("SSH_KEY", "~/.ssh/id_ed25519"))
 LLAMACPP_DIR = os.environ.get("LLAMACPP_DIR", "/workspace/.llamacpp")            # persists across stop/start
 INSTANCE_FILE = os.path.expanduser(os.environ.get("VAST_INSTANCE_FILE", "~/.sparkinfer_vast_instance"))  # self-healed id
+# Comma-separated IPs of hosts known to be permanently broken (image pull hangs, SSH unreachable).
+# Set VAST_SKIP_HOSTS env or extend the default list here.
+SKIP_HOSTS_PERMANENT = set(filter(None, os.environ.get("VAST_SKIP_HOSTS", "94.177.17.69").split(",")))
 
 def sh(host, port, cmd, timeout=3600):
     try:
@@ -133,9 +136,12 @@ def provision(v, args, skip_hosts=None):
                              order="dph_total", limit=10)
     if not offers:
         print(">> no matching offers"); return None
-    # Randomise within top-5 to avoid cycling on the same bad node across retries.
-    pool = [o for o in offers[:5] if (skip_hosts or set()) - {o.get("public_ipaddr")} or not skip_hosts]
-    off = random.choice(pool) if pool else offers[0]
+    # Exclude permanently blacklisted hosts + any session-level skip_hosts.
+    all_skip = SKIP_HOSTS_PERMANENT | (skip_hosts or set())
+    pool = [o for o in offers[:5] if o.get("public_ipaddr") not in all_skip]
+    if not pool: pool = [o for o in offers if o.get("public_ipaddr") not in all_skip]
+    if not pool: print(">> all offers are on blacklisted hosts"); return None
+    off = random.choice(pool)
     print(f">> creating instance on offer {off['id']} {off.get('gpu_name')} ${off.get('dph_total'):.3f}/hr host={off.get('public_ipaddr','?')}")
     # Create via the CLI: the SDK's create_instance has no ssh/direct kwargs (those are CLI flags),
     # and --template_hash applies a preconfigured image+env. --raw returns {success, new_contract}.
