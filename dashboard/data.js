@@ -105,6 +105,18 @@ window.SPARKINFER = {
   ],
   "prs": [
     {
+      "num": 22,
+      "title": "fix(moe): validate router inputs before launching top-k kernel",
+      "areas": [
+        "kernels",
+        "moe"
+      ],
+      "label": "none",
+      "tps": 186.27,
+      "delta_pct": null,
+      "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/22"
+    },
+    {
       "num": 23,
       "title": "fix(bench): correct Blackwell arch labels in target configs",
       "areas": [
