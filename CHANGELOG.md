@@ -3,6 +3,65 @@
 Notable changes to sparkinfer. Format loosely follows [Keep a Changelog](https://keepachangelog.com);
 versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkinfer/releases).
 
+## [0.2.0] — 2026-06-25
+
+Evaluation-pipeline hardening, anti-gaming controls, and the live frontier dashboard.
+
+### Added
+- **Opt-in RTX 5090 evaluation** — the PR auto-eval bot runs the on-device eval only after the
+  PR template's *Tested on RTX 5090* box is ticked (auto-applies `test-on-5090`) or a maintainer
+  greenlights it; otherwise the PR is labeled `not-tested` and skipped (no GPU). Falsely ticking
+  the box is treated as gaming.
+- **Live optimization-journey chart** on the [dashboard](https://gittensor-ai-lab.github.io/sparkinfer/dashboard/)
+  — recorded passes (history) plus optimizations that have **landed** on the frontier; the bot
+  appends each frontier-advancing merge automatically. Accuracy (token-match / KL) now tracks the
+  frontier instead of a stale manual value.
+- **Community safety hardening** (merged PRs) — input/scratch bounds guards across the MoE expert
+  FFN, decode runner, and router kernel; GGUF load-time validation (reject unsupported GGML types,
+  clamp invalid `general.alignment`, bounds-check tensor regions vs file size).
+
+### Security (anti-gaming)
+- **Sensitive-path merge gate** — `CODEOWNERS` + a `sensitive-paths-guard` status check + branch
+  protection block any non-maintainer PR touching the eval/scoring/governance paths (`eval/`,
+  `bench/scripts/`, `.gittensor/`, `dashboard/data.json`, `.github/`). The bot also grades with
+  `bench/scripts` pinned to `origin/main`, so a PR cannot grade itself.
+- **Contributor denylist + auto-block** — `.github/blocked-contributors.txt` (+ `FLAGGED.md`
+  evidence log); the bot flags, comments, closes, and skips eval for any PR whose opener or commit
+  author/committer is blocked. First entry: a 2-account sybil pair sharing one git identity.
+- **Copycat detection** — diff-fingerprint each PR against earlier ones; ≥80% containment of a
+  *different* author's earlier diff → `copycat` label, skipped eval, logged to `.github/copycats.json`;
+  2 strikes auto-blocks the author.
+
+### Changed
+- PRs are evaluated **oldest-first**, so the original of any duplicate is graded before its copy.
+- Dashboard: removed the obsolete **emission-weights** panel (scoring is speedup-only — there is no
+  per-subsystem budget).
+
+### Fixed (evaluation pipeline)
+- Provisioning self-heals: abandon phantom-`running` hosts in ~2 min, retry across hosts, blacklist
+  repeat offenders, and survive SSH drops during the 17 GB model download (nohup + resumable fetch).
+- Build: pin `g++-12` as the CUDA host compiler (nvcc vs Ubuntu 24.04 GCC 13.3 `cstdio` break);
+  cap `-j2` to avoid OOM on 64 GB eval boxes.
+- A submission that does not compile now yields a clean `eval:REJECT` instead of an infra error.
+- **Force-clean per-PR checkout** — each PR builds its own commit (a stale-checkout bug had graded
+  several PRs against the wrong code).
+- Labels/comments applied via the GitHub REST API (the GraphQL path silently failed on a
+  deprecation warning).
+
+### Verified
+- **RTX 5090** frontier ratcheted to **187.61 tok/s** (PDL decode; #8, `eval:L`), **top-1 98%**
+  token agreement vs llama.cpp (KL ≈ 0.14 nats).
+
+### Contributors
+First community contributors — thank you! 🎉
+[@galuis116](https://github.com/galuis116), [@jaso0n0818](https://github.com/jaso0n0818),
+[@kiannidev](https://github.com/kiannidev), [@philluiz2323](https://github.com/philluiz2323).
+
+> A fifth early account was removed for sybil / eval-gaming (one git identity across two logins,
+> farming merged-PR emissions) — see **Security** above and `.github/FLAGGED.md`.
+
+[0.2.0]: https://github.com/gittensor-ai-lab/sparkinfer/releases/tag/v0.2.0
+
 ## [0.1.0] — 2026-06-22
 
 First release of the consolidated **sparkinfer** monorepo (kernels + MoE engine + runtime + benchmarks).
