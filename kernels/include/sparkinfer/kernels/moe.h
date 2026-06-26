@@ -54,15 +54,16 @@ void launch_moe_expert_ffn(
 // Fused quantized expert FFN (decode-optimized): dequantizes only the top_k
 // routed experts on-read, one warp per output row. gate_q/up_q are Q4_K
 // [num_experts, ffn, hidden], down_q is Q6_K [num_experts, hidden, ffn] (GGUF
-// native layout). h_scratch: [num_tokens*top_k*ffn] fp32; out_scratch:
-// [num_tokens*hidden] fp32. output: [num_tokens, hidden] bf16. hidden,ffn % 256 == 0.
+// native layout). h_scratch: [num_tokens*top_k*ffn] fp32. q8_scratch: scratch for
+// the int8 down path, >= num_tokens*top_k*ffn*1.25 bytes (Q8_1: int8 + 2 fp32 per
+// 32-block). output: [num_tokens, hidden] bf16. hidden,ffn % 256 == 0.
 // gate_type/up_type/down_type are ggml type ids (12=Q4_K, 14=Q6_K); Q4_K_M mixes
 // them per tensor, so each is dispatched independently inside the kernel.
 void launch_moe_expert_ffn_q4k(
     const void* input, const void* gate_q, const void* up_q, const void* down_q,
     int gate_type, int up_type, int down_type,
     const int* expert_ids, const float* expert_weights, void* output,
-    float* h_scratch, float* out_scratch,
+    float* h_scratch, void* q8_scratch,
     int num_tokens, int top_k, int hidden, int ffn,
     cudaStream_t stream = nullptr);
 

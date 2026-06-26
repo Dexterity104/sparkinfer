@@ -70,7 +70,8 @@ struct Qwen35Model::Impl {
     float* d_shared_w;
     std::vector<void*> owned;   // device buffers from load_weights / load_gguf
     // GGUF fused-expert decode scratch (allocated by load_gguf)
-    float *mf_logits = nullptr, *mf_weights = nullptr, *mf_h = nullptr, *mf_out = nullptr;
+    float *mf_logits = nullptr, *mf_weights = nullptr, *mf_h = nullptr;
+    signed char *mf_q8 = nullptr;   // Q8_1 activation scratch for the int8 down path
     int   *mf_ids = nullptr, *mf_counts = nullptr;
     // flash-decoding (KV-split) attention partials
     int n_splits = 16;
@@ -106,7 +107,8 @@ Qwen35Model::Qwen35Model(const Qwen35Config& cfg, KVCacheManager* kv, moe::MoEEn
     p_->mf_weights = p_->alloc<float>(cfg.top_k);
     p_->mf_counts  = p_->alloc<int>(cfg.n_experts);
     p_->mf_h       = p_->alloc<float>((size_t)cfg.top_k * cfg.moe_ffn);
-    p_->mf_out     = p_->alloc<float>(cfg.hidden);
+    p_->mf_q8      = p_->alloc<signed char>((size_t)cfg.top_k * cfg.moe_ffn
+                                            + 2 * ((size_t)cfg.top_k * cfg.moe_ffn / 32) * sizeof(float));
     const size_t fa_n = (size_t)cfg.n_q_heads * p_->n_splits;
     p_->fa_m   = p_->alloc<float>(fa_n);
     p_->fa_l   = p_->alloc<float>(fa_n);
@@ -120,7 +122,7 @@ Qwen35Model::~Qwen35Model() {
     cudaFree(p_->routed); cudaFree(p_->shared); cudaFree(p_->logits);
     cudaFree(p_->d_tok); cudaFree(p_->d_out_id); cudaFree(p_->d_pos);
     cudaFree(p_->d_seqlen); cudaFree(p_->d_writepos); cudaFree(p_->d_shared_ids); cudaFree(p_->d_shared_w);
-    cudaFree(p_->mf_logits); cudaFree(p_->mf_weights); cudaFree(p_->mf_h); cudaFree(p_->mf_out);
+    cudaFree(p_->mf_logits); cudaFree(p_->mf_weights); cudaFree(p_->mf_h); cudaFree(p_->mf_q8);
     cudaFree(p_->mf_ids); cudaFree(p_->mf_counts);
     cudaFree(p_->fa_m); cudaFree(p_->fa_l); cudaFree(p_->fa_acc);
     if (p_->graph_ready) { cudaGraphExecDestroy(p_->cu_exec); cudaGraphDestroy(p_->cu_graph); }
@@ -210,7 +212,7 @@ int Qwen35Model::forward_token(int token_id, int position) {
                                        1, c.n_experts, c.top_k, 1, st);
             kernels::launch_moe_expert_ffn_q4k(s.hn, w.gate_q, w.up_q, w.down_q,
                                                w.gate_qtype, w.up_qtype, w.down_qtype,
-                                               s.mf_ids, s.mf_weights, s.routed, s.mf_h, s.mf_out,
+                                               s.mf_ids, s.mf_weights, s.routed, s.mf_h, s.mf_q8,
                                                1, c.top_k, c.hidden, c.moe_ffn, st);
         } else {
             s.engine->set_layer_weights(L, {w.router_w, w.gate, w.up, w.down});

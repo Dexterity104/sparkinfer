@@ -283,18 +283,19 @@ __global__ void down_q6k_splitk_kernel(
     }
 }
 
-// int8 dp4a (MMVQ) Q6_K down-projection. The activation is quantized to Q8_1
-// (no sum term: Q6_K is symmetric), then dp4a'd against the Q6_K weight. Same
-// vec_dot_q6_K_q8_1 math llama.cpp uses for ffn_down; the bit layout matches the
-// fp unpack in q4kf_deq_dot, so only the accumulation differs.
+// int8 dp4a (MMVQ) down-projection. The SwiGLU activation is quantized to Q8_1
+// ONCE per token (quant_h_q8_kernel), then dp4a'd against the quantized down
+// weight. Covers Q6_K (symmetric, no sum term) and Q4_K (min term via the Q8_1
+// sum). Bit layout matches the fp unpack in q4kf_deq_dot; only the accumulation
+// is int8.
 
 // pack 4 unaligned bytes into an int (Q6_K blocks are 210 B, not 4-byte aligned)
 __device__ __forceinline__ int q6k_pack4(const unsigned char* p) {
     return (int)((unsigned)p[0] | (unsigned)p[1] << 8 | (unsigned)p[2] << 16 | (unsigned)p[3] << 24);
 }
 
-// Dot one 256-block's 32-wide sub-block `sib` against Q8_1 activation `aint`
-// (8 ints), scaled by activation scale `xd`. Each 16-wide half has its own weight scale.
+// Dot one Q6_K 256-block's 32-wide sub-block `sib` against Q8_1 activation `aint`
+// (8 ints), scaled by `xd`. Each 16-wide half has its own weight scale.
 __device__ __forceinline__ float q6k_mmvq_dot(const unsigned char* blk, int sib,
                                               const int* aint, float xd) {
     const int half = sib >> 2, slot = sib & 3;
@@ -317,42 +318,66 @@ __device__ __forceinline__ float q6k_mmvq_dot(const unsigned char* blk, int sib,
     return q4kf_h2f(blk + 208) * xd * ((float)sc[2 * slot] * lo + (float)sc[2 * slot + 1] * hi);
 }
 
-// down (MMVQ): out[tok,hh] = sum_j w_j * <h_j, down[e_j, hh]>, int8.
-__global__ void down_q6k_mmvq_kernel(
-    const unsigned char* __restrict__ down_q, const int* __restrict__ expert_ids,
-    const float* __restrict__ expert_weights, const float* __restrict__ h_scratch,
-    __nv_bfloat16* __restrict__ output, int H, int F, int top_k
-) {
-    extern __shared__ char smem_dn[];
-    signed char* s_hq8 = reinterpret_cast<signed char*>(smem_dn);             // [top_k*F]
-    float*       s_hd  = reinterpret_cast<float*>(s_hq8 + (size_t)top_k * F);  // [top_k*F/32]
-    const int token = blockIdx.x, warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-
-    // quantize the top_k SwiGLU activations to Q8_1 (one 32-block per warp step)
-    for (int b = warp; b < (top_k * F) >> 5; b += WPB) {
-        float x = h_scratch[(size_t)token * top_k * F + b * 32 + lane], a = fabsf(x);
-        #pragma unroll
-        for (int m = 16; m > 0; m >>= 1) a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, m));
-        float d = a / 127.0f;
-        s_hq8[b * 32 + lane] = (signed char)(a == 0.0f ? 0 : (int)roundf(x / d));
-        if (lane == 0) s_hd[b] = d;
+// Dot one Q4_K 256-block's 32-wide sub-block `sib` against Q8_1 activation `aint`
+// (aligned int reads), with the Q4_K min term (xs = Q8_1 sum). Same identity as
+// gate_up_q4k_mmvq_kernel.
+__device__ __forceinline__ float q4k_mmvq_dot(const unsigned char* blk, int sib,
+                                              const int* aint, float xd, float xs) {
+    float d = q4kf_h2f(blk), dmin = q4kf_h2f(blk + 2);
+    int scd, scm; q4kf_scale_min(sib, blk + 4, &scd, &scm);
+    const int* q = reinterpret_cast<const int*>(blk + 16 + (sib >> 1) * 32);
+    const bool hi = sib & 1;
+    int sumi = 0;
+    #pragma unroll
+    for (int k = 0; k < 8; k++) {
+        int w = hi ? ((q[k] >> 4) & 0x0F0F0F0F) : (q[k] & 0x0F0F0F0F);
+        sumi = __dp4a(w, aint[k], sumi);
     }
-    __syncthreads();
+    return d * (float)scd * xd * (float)sumi - dmin * (float)scm * xs;
+}
 
+// Quantize the top_k SwiGLU activations to Q8_1 ONCE per token (shared by every H
+// output row of the down kernel). q8 = int8, qd = per-32-block scale, qs = d*sum.
+__global__ void quant_h_q8_kernel(const float* __restrict__ h, signed char* __restrict__ q8,
+                                  float* __restrict__ qd, float* __restrict__ qs, int n) {
+    const int b = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);   // 32-block index
+    const int lane = threadIdx.x & 31;
+    if ((b << 5) >= n) return;
+    float x = h[(b << 5) + lane], a = fabsf(x);
+    #pragma unroll
+    for (int m = 16; m > 0; m >>= 1) a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, m));
+    float d = a / 127.0f;
+    int v = (a == 0.0f) ? 0 : (int)roundf(x / d);
+    q8[(b << 5) + lane] = (signed char)v;
+    int sm = v;
+    #pragma unroll
+    for (int m = 16; m > 0; m >>= 1) sm += __shfl_xor_sync(0xffffffffu, sm, m);
+    if (lane == 0) { qd[b] = d; qs[b] = d * (float)sm; }
+}
+
+// down (MMVQ): out[tok,hh] = sum_j w_j * <h_j, down[e_j, hh]>, int8. Reads the
+// pre-quantized Q8_1 activation; covers Q4_K and Q6_K. (expert, 32-block) work
+// units stripe over all 32 lanes, then warp-reduce.
+__global__ void down_mmvq_kernel(
+    const unsigned char* __restrict__ down_q, const int* __restrict__ expert_ids,
+    const float* __restrict__ expert_weights, const signed char* __restrict__ h_q8,
+    const float* __restrict__ h_d, const float* __restrict__ h_s,
+    __nv_bfloat16* __restrict__ output, int H, int F, int top_k, int down_type
+) {
+    const int token = blockIdx.x, warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int hh = blockIdx.y * WPB + warp;
     if (hh >= H) return;
-    const int nblk = F >> 8, nsb = F >> 5;    // 256-blocks / 32-blocks per expert row
+    const int nsb = F >> 5, nblk = F >> 8, dbb = q_block_bytes(down_type);
+    const int total = top_k * nsb;
     float acc = 0.f;
-    for (int j = 0; j < top_k; j++) {
-        const int ts = token * top_k + j, e = expert_ids[ts];
-        const unsigned char* drow = down_q + ((size_t)e * H + hh) * nblk * 210;
-        const signed char* aq8 = s_hq8 + (size_t)j * F;
-        const float*       asd = s_hd + (size_t)j * nsb;
-        float p = 0.f;
-        for (int sb = lane; sb < nsb; sb += 32)
-            p += q6k_mmvq_dot(drow + (size_t)(sb >> 3) * 210, sb & 7,
-                              reinterpret_cast<const int*>(aq8 + sb * 32), asd[sb]);
-        acc += expert_weights[ts] * p;
+    for (int u = lane; u < total; u += 32) {
+        const int j = u / nsb, sb = u - j * nsb;
+        const int ts = token * top_k + j, e = expert_ids[ts], si = ts * nsb + sb;
+        const unsigned char* b = down_q + ((size_t)e * H + hh) * nblk * dbb + (size_t)(sb >> 3) * dbb;
+        const int* aint = reinterpret_cast<const int*>(h_q8 + (size_t)ts * F + sb * 32);
+        float dot = (down_type == 14) ? q6k_mmvq_dot(b, sb & 7, aint, h_d[si])
+                                      : q4k_mmvq_dot(b, sb & 7, aint, h_d[si], h_s[si]);
+        acc += expert_weights[ts] * dot;
     }
     acc = q4kf_wsum(acc);
     if (lane == 0) output[(size_t)token * H + hh] = __float2bfloat16(acc);
@@ -366,10 +391,9 @@ void launch_moe_expert_ffn_q4k(
     const void* input, const void* gate_q, const void* up_q, const void* down_q,
     int gate_type, int up_type, int down_type,
     const int* expert_ids, const float* expert_weights, void* output,
-    float* h_scratch, float* out_scratch,
+    float* h_scratch, void* q8_scratch,
     int num_tokens, int top_k, int hidden, int ffn, cudaStream_t stream
 ) {
-    (void)out_scratch;
     // SPARKINFER_MMVQ=1 selects the int8 dp4a path for Q4_K gate/up (decode parity
     // with llama.cpp's MMVQ). bf16 dequant-GEMV stays the default; down is unchanged.
     static int mmvq = -1;
@@ -396,16 +420,21 @@ void launch_moe_expert_ffn_q4k(
     if (splitk < 0) { const char* sv = getenv("SPARKINFER_SPLITK"); splitk = (sv && sv[0] == '1') ? 1 : 0; }
     static int pdl = -1;
     if (pdl < 0) { const char* pv = getenv("SPARKINFER_PDL"); pdl = (pv && pv[0] == '1') ? 1 : 0; }
-    // Q6_K down int8 dp4a, on by default; SPARKINFER_MMVQ=0 selects the fp baseline.
+    // down int8 dp4a (Q4_K + Q6_K), on by default; SPARKINFER_MMVQ=0 = fp baseline.
+    // Activation is quantized to Q8_1 once per token, then the down kernel reads it.
     static int down_mmvq = -1;
     if (down_mmvq < 0) { const char* dv = getenv("SPARKINFER_MMVQ"); down_mmvq = (dv && dv[0] == '0') ? 0 : 1; }
-    if (down_mmvq && down_type == 14) {
-        size_t sm = (size_t)top_k * ffn + (size_t)top_k * (ffn >> 5) * sizeof(float);
+    if (down_mmvq && (down_type == 12 || down_type == 14)) {
+        const int n = num_tokens * top_k * ffn;
+        signed char* h_q8 = reinterpret_cast<signed char*>(q8_scratch);
+        float* h_d = reinterpret_cast<float*>(h_q8 + (size_t)n);
+        float* h_s = h_d + (size_t)(n >> 5);
+        quant_h_q8_kernel<<<((n >> 5) + WPB - 1) / WPB, WPB * 32, 0, stream>>>(h_scratch, h_q8, h_d, h_s, n);
         dim3 dn(num_tokens, (hidden + WPB - 1) / WPB);
-        down_q6k_mmvq_kernel<<<dn, WPB * 32, sm, stream>>>(
+        down_mmvq_kernel<<<dn, WPB * 32, 0, stream>>>(
             reinterpret_cast<const unsigned char*>(down_q),
-            expert_ids, expert_weights, h_scratch,
-            reinterpret_cast<__nv_bfloat16*>(output), hidden, ffn, top_k);
+            expert_ids, expert_weights, h_q8, h_d, h_s,
+            reinterpret_cast<__nv_bfloat16*>(output), hidden, ffn, top_k, down_type);
     } else if (splitk) {   // split-K down: 4 warps/row -> 4x warps in flight (occupancy lever)
         const int RPB = WPB / 4;
         dim3 dns(num_tokens, (hidden + RPB - 1) / RPB);
