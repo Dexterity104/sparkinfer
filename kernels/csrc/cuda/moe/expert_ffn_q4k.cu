@@ -283,6 +283,81 @@ __global__ void down_q6k_splitk_kernel(
     }
 }
 
+// int8 dp4a (MMVQ) Q6_K down-projection. The activation is quantized to Q8_1
+// (no sum term: Q6_K is symmetric), then dp4a'd against the Q6_K weight. Same
+// vec_dot_q6_K_q8_1 math llama.cpp uses for ffn_down; the bit layout matches the
+// fp unpack in q4kf_deq_dot, so only the accumulation differs.
+
+// pack 4 unaligned bytes into an int (Q6_K blocks are 210 B, not 4-byte aligned)
+__device__ __forceinline__ int q6k_pack4(const unsigned char* p) {
+    return (int)((unsigned)p[0] | (unsigned)p[1] << 8 | (unsigned)p[2] << 16 | (unsigned)p[3] << 24);
+}
+
+// Dot one 256-block's 32-wide sub-block `sib` against Q8_1 activation `aint`
+// (8 ints), scaled by activation scale `xd`. Each 16-wide half has its own weight scale.
+__device__ __forceinline__ float q6k_mmvq_dot(const unsigned char* blk, int sib,
+                                              const int* aint, float xd) {
+    const int half = sib >> 2, slot = sib & 3;
+    const unsigned char* ql = blk + half * 64;
+    const unsigned char* qh = blk + 128 + half * 32;
+    const signed char*   sc = (const signed char*)(blk + 192) + half * 8;
+    const int  qloff = (slot & 1) ? 32 : 0;   // slots 1,3 read the +32 ql bytes
+    const bool hiNib = slot >= 2;             // slots 2,3 use the high nibble
+    const int  shift = 2 * slot;
+    int lo = 0, hi = 0;                        // l 0..15 / 16..31
+    #pragma unroll
+    for (int k = 0; k < 8; k++) {
+        int qlb = q6k_pack4(ql + qloff + 4 * k);
+        int qhb = q6k_pack4(qh + 4 * k);
+        int nib = hiNib ? ((qlb >> 4) & 0x0F0F0F0F) : (qlb & 0x0F0F0F0F);
+        int v   = __vsubss4(nib | (((qhb >> shift) & 0x03030303) << 4), 0x20202020);  // q6 - 32
+        if (k < 4) lo = __dp4a(v, aint[k], lo);
+        else       hi = __dp4a(v, aint[k], hi);
+    }
+    return q4kf_h2f(blk + 208) * xd * ((float)sc[2 * slot] * lo + (float)sc[2 * slot + 1] * hi);
+}
+
+// down (MMVQ): out[tok,hh] = sum_j w_j * <h_j, down[e_j, hh]>, int8.
+__global__ void down_q6k_mmvq_kernel(
+    const unsigned char* __restrict__ down_q, const int* __restrict__ expert_ids,
+    const float* __restrict__ expert_weights, const float* __restrict__ h_scratch,
+    __nv_bfloat16* __restrict__ output, int H, int F, int top_k
+) {
+    extern __shared__ char smem_dn[];
+    signed char* s_hq8 = reinterpret_cast<signed char*>(smem_dn);             // [top_k*F]
+    float*       s_hd  = reinterpret_cast<float*>(s_hq8 + (size_t)top_k * F);  // [top_k*F/32]
+    const int token = blockIdx.x, warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+
+    // quantize the top_k SwiGLU activations to Q8_1 (one 32-block per warp step)
+    for (int b = warp; b < (top_k * F) >> 5; b += WPB) {
+        float x = h_scratch[(size_t)token * top_k * F + b * 32 + lane], a = fabsf(x);
+        #pragma unroll
+        for (int m = 16; m > 0; m >>= 1) a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, m));
+        float d = a / 127.0f;
+        s_hq8[b * 32 + lane] = (signed char)(a == 0.0f ? 0 : (int)roundf(x / d));
+        if (lane == 0) s_hd[b] = d;
+    }
+    __syncthreads();
+
+    const int hh = blockIdx.y * WPB + warp;
+    if (hh >= H) return;
+    const int nblk = F >> 8, nsb = F >> 5;    // 256-blocks / 32-blocks per expert row
+    float acc = 0.f;
+    for (int j = 0; j < top_k; j++) {
+        const int ts = token * top_k + j, e = expert_ids[ts];
+        const unsigned char* drow = down_q + ((size_t)e * H + hh) * nblk * 210;
+        const signed char* aq8 = s_hq8 + (size_t)j * F;
+        const float*       asd = s_hd + (size_t)j * nsb;
+        float p = 0.f;
+        for (int sb = lane; sb < nsb; sb += 32)
+            p += q6k_mmvq_dot(drow + (size_t)(sb >> 3) * 210, sb & 7,
+                              reinterpret_cast<const int*>(aq8 + sb * 32), asd[sb]);
+        acc += expert_weights[ts] * p;
+    }
+    acc = q4kf_wsum(acc);
+    if (lane == 0) output[(size_t)token * H + hh] = __float2bfloat16(acc);
+}
+
 #ifndef SPARKINFER_NVRTC_DEVICE_ONLY
 #include "sparkinfer/kernels/moe.h"
 #include <cstdlib>
@@ -321,7 +396,17 @@ void launch_moe_expert_ffn_q4k(
     if (splitk < 0) { const char* sv = getenv("SPARKINFER_SPLITK"); splitk = (sv && sv[0] == '1') ? 1 : 0; }
     static int pdl = -1;
     if (pdl < 0) { const char* pv = getenv("SPARKINFER_PDL"); pdl = (pv && pv[0] == '1') ? 1 : 0; }
-    if (splitk) {   // split-K down: 4 warps/row -> 4x warps in flight (occupancy lever)
+    // Q6_K down int8 dp4a, on by default; SPARKINFER_MMVQ=0 selects the fp baseline.
+    static int down_mmvq = -1;
+    if (down_mmvq < 0) { const char* dv = getenv("SPARKINFER_MMVQ"); down_mmvq = (dv && dv[0] == '0') ? 0 : 1; }
+    if (down_mmvq && down_type == 14) {
+        size_t sm = (size_t)top_k * ffn + (size_t)top_k * (ffn >> 5) * sizeof(float);
+        dim3 dn(num_tokens, (hidden + WPB - 1) / WPB);
+        down_q6k_mmvq_kernel<<<dn, WPB * 32, sm, stream>>>(
+            reinterpret_cast<const unsigned char*>(down_q),
+            expert_ids, expert_weights, h_scratch,
+            reinterpret_cast<__nv_bfloat16*>(output), hidden, ffn, top_k);
+    } else if (splitk) {   // split-K down: 4 warps/row -> 4x warps in flight (occupancy lever)
         const int RPB = WPB / 4;
         dim3 dns(num_tokens, (hidden + RPB - 1) / RPB);
         if (pdl) {   // PDL: down's grid spin-up overlaps gate_up's tail (programmatic dependent launch)
