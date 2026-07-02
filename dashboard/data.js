@@ -927,6 +927,16 @@ window.SPARKINFER = {
   ],
   "landed_longctx": [
     {
+      "name": "v0.3.3 adaptive split POC",
+      "tps": 166.2,
+      "pr": 115,
+      "ctx": 16384,
+      "date": "2026-06-30",
+      "release": "v0.3.3",
+      "author": "ai-hpc",
+      "baseline": true
+    },
+    {
       "name": "Optimize 16k long-context GQ",
       "tps": 221.02,
       "pr": 123,
@@ -954,5 +964,49 @@ window.SPARKINFER = {
       "ctx": 16384,
       "date": "2026-07-02"
     }
-  ]
+  ],
+  "longctx_release_baselines": {
+    "name": "v0.3.3 long-context POC",
+    "author": "ai-hpc",
+    "release": "v0.3.3",
+    "commit": "351cef8",
+    "date": "2026-06-30",
+    "note": "release-log sweep: fixed n_splits=32 before vs depth-adaptive after; RTX 5090, decode tok/s at KV depth",
+    "color_before": "#8A8AA0",
+    "color_after": "#D14D72",
+    "rows": [
+      {
+        "ctx": 128,
+        "label": "128",
+        "before_tps": 442.8,
+        "after_tps": 442.7,
+        "speedup": 1.0,
+        "gap_to_llama": "unchanged"
+      },
+      {
+        "ctx": 4096,
+        "label": "4k",
+        "before_tps": 194.0,
+        "after_tps": 193.8,
+        "speedup": 1.0,
+        "gap_to_llama": "unchanged"
+      },
+      {
+        "ctx": 16384,
+        "label": "16k",
+        "before_tps": 70.8,
+        "after_tps": 166.2,
+        "speedup": 2.35,
+        "gap_to_llama": "3.4x -> 1.44x"
+      },
+      {
+        "ctx": 32768,
+        "label": "32k",
+        "before_tps": 38.5,
+        "after_tps": 110.7,
+        "speedup": 2.88,
+        "gap_to_llama": "5.0x -> 1.74x"
+      }
+    ]
+  }
 };
