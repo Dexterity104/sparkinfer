@@ -93,6 +93,16 @@
   .cmp .fill.us{background:linear-gradient(90deg,var(--theme),#a78bff)}
   .cmp .fill.them{background:linear-gradient(90deg,#2a2540,#555)}
   .gap{font-family:"Sora";font-weight:800;font-size:34px;color:var(--theme)}
+  .anchor-grid{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-top:18px;padding-top:18px;border-top:1px solid var(--line)}
+  .anchor{border:1px solid var(--line);border-radius:12px;padding:14px;background:#fbfbfd}
+  .anchor-top{display:flex;align-items:baseline;justify-content:space-between;gap:12px;margin-bottom:10px}
+  .anchor-title{font-family:"Sora";font-weight:800;color:var(--title);font-size:14px}
+  .anchor-delta{font-family:"Sora";font-weight:800;font-size:13px;color:var(--theme)}
+  .anchor-delta.neg{color:var(--bad)}
+  .anchor .bar-row{grid-template-columns:108px 1fr 64px;margin:7px 0}
+  .anchor .bar-row .nm{font-size:12.5px}
+  .anchor .bar-row .nm small{font-size:10.5px}
+  .anchor .bar-row .v{font-size:12.5px}
   .ctx-head{display:grid;grid-template-columns:92px 1fr 72px;gap:12px;margin-top:18px;padding-top:16px;border-top:1px solid var(--line);font-size:11.5px;font-weight:700;text-transform:uppercase;letter-spacing:.05em;color:var(--muted)}
   .ctx-group{margin-top:10px}
   .ctx-title{font-family:"Sora";font-weight:800;color:var(--title);font-size:13px;margin:10px 0 5px}
@@ -118,7 +128,7 @@
   .f-brand{font-family:"Sora",sans-serif;font-weight:700;color:var(--title)}
   .f-brand b{color:var(--theme)}
   .f-sep{color:var(--line)}
-  @media(max-width:820px){.kpis{grid-template-columns:1fr 1fr}.grid2{grid-template-columns:1fr}.hero h1{font-size:32px}.bar-row{grid-template-columns:110px 1fr 56px}}
+  @media(max-width:820px){.kpis{grid-template-columns:1fr 1fr}.grid2,.anchor-grid{grid-template-columns:1fr}.hero h1{font-size:32px}.bar-row{grid-template-columns:110px 1fr 56px}}
 </style>
 </head>
 <body>
@@ -279,6 +289,23 @@
 
   const ctxRows = (D.context_baselines||[]);
   const ctxMax = ctxRows.length ? Math.max(...ctxRows.flatMap(x=>[x.sparkinfer_tps, x.llamacpp_decode_tps||0])) : 0;
+  const row16 = ctxRows.find(x=>x.ctx===16384) || {};
+  const anchorRows = [
+    {title:"128-token decode", sub:"no prefill context", spark:s.frontier_tps, llama:s.ref_tps},
+    {title:"16k-context decode", sub:"128 generated tokens", spark:row16.sparkinfer_tps, llama:row16.llamacpp_decode_tps}
+  ].filter(x=>x.spark && x.llama);
+  const anchorMax = anchorRows.length ? Math.max(...anchorRows.flatMap(x=>[x.spark,x.llama])) : 0;
+  const anchorsHtml = anchorRows.length ? `
+    <div class="anchor-grid">
+      ${anchorRows.map(x=>{
+        const d=100*(x.spark-x.llama)/x.llama;
+        return `<div class="anchor">
+          <div class="anchor-top"><div><div class="anchor-title">${x.title}</div><div style="font-size:12px;color:var(--muted)">${x.sub}</div></div><div class="anchor-delta ${d<0?'neg':''}">${d>=0?'+':''}${d.toFixed(1)}%</div></div>
+          <div class="bar-row"><div class="nm">sparkinfer<small>ai-hpc</small></div><div class="track"><div class="fill us" style="width:${(x.spark/anchorMax*100).toFixed(1)}%"></div></div><div class="v">${x.spark}</div></div>
+          <div class="bar-row"><div class="nm">${s.ref_name}<small>baseline</small></div><div class="track"><div class="fill them" style="width:${(x.llama/anchorMax*100).toFixed(1)}%"></div></div><div class="v">${x.llama}</div></div>
+        </div>`
+      }).join("")}
+    </div>` : "";
   const ctxHtml = ctxRows.length ? `
     <div class="ctx-head"><div>Context</div><div>Decode speed</div><div style="text-align:right">tok/s</div></div>
     ${ctxRows.map(x=>`
@@ -295,6 +322,7 @@
     <div style="margin-top:14px;text-align:center">${ahead
       ? `<span class="gap">+${pct.toFixed(1)}%</span> <span style="color:var(--muted);font-size:13px">faster than ${s.ref_name} at 128-tok decode</span>`
       : `<span class="gap">${gapx}×</span> <span style="color:var(--muted);font-size:13px">to close — launch-bound; fusion is the lever</span>`}</div>
+    ${anchorsHtml}
     ${ctxHtml}`;
 
   $("labels").innerHTML = D.labels.map(x=>`<span class="lg"><span class="dot" style="background:${x.c}"></span><b style="color:var(--title)">${x.l}</b> — ${x.d}</span>`).join("");
