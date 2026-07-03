@@ -12,8 +12,6 @@ _It is designed for the next generation of personal agents like **Openclaw**, lo
 
 ## Benchmark
 
-Live RTX 5090 decode, batch size 1, 128 generated tokens:
-
 | context | sparkinfer<br>GGUF Q4_K_M | llama.cpp<br>GGUF Q4_K_M | vLLM<br>GPTQ Int4 | SGLang<br>GPTQ Int4 | TensorRT-LLM<br>NVFP4 |
 |---:|---:|---:|---:|---:|---:|
 | 128 | **493.56 tok/s** | 365.85 tok/s | 280.83 tok/s | 241.21 tok/s | 99.00 tok/s |
