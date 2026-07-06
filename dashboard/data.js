@@ -1676,13 +1676,6 @@ window.SPARKINFER = {
       "pr": 266,
       "date": "2026-07-06",
       "label": "L"
-    },
-    {
-      "name": "fused QK-norm+RoPE+KV-append",
-      "tps": 300.16,
-      "pr": 266,
-      "date": "2026-07-06",
-      "label": "L"
     }
   ]
 };
